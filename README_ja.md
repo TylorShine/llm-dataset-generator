@@ -23,7 +23,7 @@
 
 1.  **リポジトリをクローンします:**
     ```bash
-    git clone https://github.com/your-username/llm-dataset-generator.git
+    git clone https://github.com/TylorShine/llm-dataset-generator.git
     cd llm-dataset-generator
     ```
 
