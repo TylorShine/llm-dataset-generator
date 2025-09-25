@@ -1,0 +1,19 @@
+# prompts/qa_template.yaml
+
+# This is a system prompt that sets the context for the model.
+system_prompt: "You are a helpful assistant that answers questions accurately based on the provided context."
+
+# This is the template for the user's message.
+# The {{ context }} and {{ question }} will be replaced by data from
+# the SQuAD dataset columns.
+user_prompt_template: >
+  Based on the following context, please answer the question.
+
+  Context:
+  """
+  {{ context }}
+  """
+
+  Question: {{ question }}
+
+  Answer:

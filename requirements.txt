@@ -1,0 +1,7 @@
+openai
+pyyaml
+jinja2
+datasets
+python-dotenv
+tqdm
+nltk
