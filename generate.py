@@ -6,14 +6,15 @@ import json
 import time
 import argparse
 import random
+import asyncio
 from pathlib import Path
 
 import yaml
 from jinja2 import Template
-from openai import OpenAI, RateLimitError, APIError
+from openai import AsyncOpenAI, RateLimitError, APIError
 from datasets import load_dataset
 from dotenv import load_dotenv
-from tqdm import tqdm
+from tqdm.asyncio import tqdm
 import nltk
 
 # --- Text Chunking Helper ---
@@ -91,22 +92,42 @@ def parse_arguments():
     
     # Control and Logging
     parser.add_argument("--save-interval", type=int, default=10, help="How often to save the intermediate dataset.")
+    parser.add_argument("--concurrency", type=int, default=5, help="Number of asynchronous requests to make.")
     return parser.parse_args()
 
-# --- API Interaction with Retry Logic ---
-def call_api_with_retry(client, model, system_prompt, user_prompt, max_tokens, temperature):
-    max_retries = 5
-    backoff_factor = 2
-    wait_time = 1
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(model=model, messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}], max_tokens=max_tokens, temperature=temperature)
-            return response.choices[0].message.content.strip()
-        except (RateLimitError, APIError) as e:
-            print(f"API/Rate limit error on attempt {attempt + 1}: {e}. Retrying in {wait_time}s...")
-        time.sleep(wait_time)
-        wait_time *= backoff_factor
-    raise Exception("Failed to get a response from the API after multiple retries.")
+# --- Asynchronous API Interaction with Retry Logic ---
+async def generate_conversation_async(client, model, system_prompt, user_prompt, max_tokens, temperature, semaphore):
+    """
+    An async worker that calls the API for a single prompt, with retries and concurrency control.
+    """
+    async with semaphore:
+        max_retries = 5
+        wait_time = 1
+        for attempt in range(max_retries):
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    max_tokens=max_tokens,
+                    temperature=temperature
+                )
+                model_response = response.choices[0].message.content.strip()
+                return {
+                    "id": str(uuid.uuid4()),
+                    "conversations": [
+                        {"from": "human", "value": user_prompt},
+                        {"from": "gpt", "value": model_response}
+                    ]
+                }
+            except (RateLimitError, APIError) as e:
+                if attempt == max_retries - 1:
+                    print(f"Final attempt failed for a prompt. Error: {e}")
+                    return None # Failed after all retries
+                await asyncio.sleep(wait_time * (2 ** attempt)) # Exponential backoff
+        return None # Should not be reached, but for safety
 
 # --- Data Loading and Processing ---
 def load_prompt_template(file_path: Path):
@@ -121,7 +142,7 @@ def save_dataset(data: list, file_path: Path):
     print(f"\nSuccessfully saved {len(data)} items to {file_path}")
 
 # --- Main Generation Logic ---
-def main():
+async def main():
     """Main function to orchestrate the dataset generation process."""
     args = parse_arguments()
     
@@ -140,79 +161,64 @@ def main():
     if not api_key or not base_url:
         raise ValueError("OPENAI_API_KEY and OPENAI_BASE_URL must be set in the .env file.")
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    print(f"Initialized OpenAI client for model: {args.model}")
+    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    print(f"Initialized AsyncOpenAI client for model: {args.model}")
     
     system_prompt, user_prompt_str = load_prompt_template(args.prompt_file)
     user_template = Template(user_prompt_str)
     print(f"Loaded prompt template from: {args.prompt_file}")
     
-    print(f"Loading dataset '{args.dataset_name}' (split: {args.dataset_split}) in streaming mode...")
-    hf_dataset = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True)
-    dataset_iterator = iter(hf_dataset)
+    # 1. Prepare all inputs first to know the total number of API calls
+    print("Preparing generation inputs from the dataset...")
+    generation_inputs = []
+    hf_dataset = load_dataset(args.dataset_name, split=args.dataset_split, streaming=True).skip(args.start_index)
     
-    if args.start_index > 0:
-        print(f"Skipping to start index: {args.start_index}...")
-        for _ in tqdm(range(args.start_index), desc="Skipping records"):
-            next(dataset_iterator)
-
-    generated_data = []
-    print(f"Starting generation of {args.num_samples} samples...")
-    pbar = tqdm(total=args.num_samples, desc="Generating Samples")
-    
-    while len(generated_data) < args.num_samples:
-        try:
-            hf_record = next(dataset_iterator)
+    pbar_prepare = tqdm(total=args.num_samples, desc="Scanning dataset")
+    for hf_record in hf_dataset:
+        if len(generation_inputs) >= args.num_samples: break
+        
+        records_to_process = []
+        if args.chunk_column and args.chunk_column in hf_record:
+            chunks = chunk_text(hf_record[args.chunk_column], by=args.chunk_by, size_min=args.chunk_size_min, size_max=args.chunk_size_max)
+            for chunk in chunks:
+                records_to_process.append({**hf_record, args.chunk_column: chunk})
+        elif args.split_column and args.split_column in hf_record:
+            chunks = [c.strip() for c in hf_record[args.split_column].split(args.split_separator) if c.strip()]
+            for chunk in chunks:
+                records_to_process.append({**hf_record, args.split_column: chunk})
+        else:
+            records_to_process.append(hf_record)
             
-            records_to_process = []
-            
-            # Prioritize chunking logic
-            if args.chunk_column and args.chunk_column in hf_record:
-                text_to_chunk = hf_record[args.chunk_column]
-                chunks = chunk_text(text_to_chunk, by=args.chunk_by, size_min=args.chunk_size_min, size_max=args.chunk_size_max)
-                for chunk in chunks:
-                    modified_record = hf_record.copy()
-                    modified_record[args.chunk_column] = chunk
-                    records_to_process.append(modified_record)
-            
-            # Fallback to splitting logic
-            elif args.split_column and args.split_column in hf_record:
-                text_to_split = hf_record[args.split_column]
-                chunks = [chunk.strip() for chunk in text_to_split.split(args.split_separator) if chunk.strip()]
-                for chunk in chunks:
-                    modified_record = hf_record.copy()
-                    modified_record[args.split_column] = chunk
-                    records_to_process.append(modified_record)
-            
-            # Default case: no splitting or chunking
-            else:
-                records_to_process.append(hf_record)
-
-            # Process each record (or chunk)
-            for record in records_to_process:
-                if len(generated_data) >= args.num_samples: break
-                
+        for record in records_to_process:
+            if len(generation_inputs) < args.num_samples:
                 final_user_prompt = user_template.render(record)
-                model_response = call_api_with_retry(client, args.model, system_prompt, final_user_prompt, args.max_tokens, args.temperature)
-
-                conversation_item = {"id": str(uuid.uuid4()), "conversations": [{"from": "human", "value": final_user_prompt}, {"from": "gpt", "value": model_response}]}
-                generated_data.append(conversation_item)
-                pbar.update(1)
-
-                if len(generated_data) % args.save_interval == 0:
-                    save_dataset(generated_data, args.output_file)
-                    pbar.set_postfix_str(f"Saved {len(generated_data)} records")
-
-        except StopIteration:
-            print("\nReached the end of the Hugging Face dataset.")
-            break
-        except Exception as e:
-            print(f"\nAn error occurred: {e}")
-            print("Saving progress and stopping generation.")
-            break
+                generation_inputs.append(final_user_prompt)
+                pbar_prepare.update(1)
+    pbar_prepare.close()
     
-    pbar.close()
+    if not generation_inputs:
+        print("No inputs were prepared. Exiting.")
+        return
+
+    print(f"Prepared {len(generation_inputs)} prompts. Starting concurrent generation...")
+    
+    # 2. Run generation tasks concurrently
+    semaphore = asyncio.Semaphore(args.concurrency)
+    tasks = [
+        generate_conversation_async(client, args.model, system_prompt, user_prompt, args.max_tokens, args.temperature, semaphore)
+        for user_prompt in generation_inputs
+    ]
+    
+    generated_data = []
+    for future in tqdm.as_completed(tasks, desc="Generating Samples"):
+        result = await future
+        if result:
+            generated_data.append(result)
+            if len(generated_data) % args.save_interval == 0:
+                save_dataset(generated_data, args.output_file)
+    
+    # Final save
     save_dataset(generated_data, args.output_file)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

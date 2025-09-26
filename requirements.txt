@@ -5,3 +5,4 @@ datasets
 python-dotenv
 tqdm
 nltk
+httpx
