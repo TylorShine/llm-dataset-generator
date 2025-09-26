@@ -1,3 +1,18 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "openai",
+#     "pyyaml",
+#     "jinja2",
+#     "datasets",
+#     "python-dotenv",
+#     "tqdm",
+#     "nltk",
+#     "httpx",
+# ]
+# ///
+
+
 # generate.py
 
 import os
